@@ -1,0 +1,236 @@
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  IsDev:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+  DomainName:
+    Type: String
+  AcmCertificateArn:
+    Type: String
+
+Conditions:
+  IsDev: !Equals [!Ref IsDev, "true"]
+  IsProd: !Equals [!Ref IsDev, "false"]
+
+Mappings:
+  Region:
+    us-east-1:
+      Ami: ami-03a45a5ac837f33b7
+      Subnets:
+        - subnet-c98797ae
+        - subnet-ecf3edc2
+        - subnet-2e8d2e63
+        - subnet-bf6f73e3
+        - subnet-f31334cd
+        - subnet-06c11408
+      Vpc: vpc-c9cee2b3
+
+Resources:
+  WebsiteCloudFront:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - Id: WebsiteOrigin
+            DomainName: !GetAtt WebsiteLoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: !If [IsDev, http-only, https-only]
+        DefaultCacheBehavior:
+          TargetOriginId: WebsiteOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: !Ref CloudFrontCachePolicy
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+        HttpVersion: http2
+        Aliases: 
+          - !If [IsDev, !Ref AWS::NoValue, !Ref DomainName]
+        ViewerCertificate:
+          !If
+            - IsDev
+            - !Ref AWS::NoValue
+            - AcmCertificateArn: !Ref AcmCertificateArn
+              MinimumProtocolVersion: TLSv1.2_2021
+              SslSupportMethod: sni-only
+        Comment: !Ref AWS::StackName
+
+  CloudFrontCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        DefaultTTL: !If [IsDev, 0, 86400]
+        MaxTTL: !If [IsDev, 1, 31536000]
+        MinTTL: 0
+        Name: !Ref AWS::StackName
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingBrotli: !If [IsDev, false, true]
+          EnableAcceptEncodingGzip: !If [IsDev, false, true]
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WebsiteLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Ref AWS::StackName
+      Subnets: !FindInMap
+        - Region
+        - !Ref AWS::Region
+        - Subnets
+      SecurityGroups:
+        - !GetAtt WebsiteLoadBalancerSecurityGroup.GroupId
+
+  WebsiteLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Join ["", ["load-balancer-", !Ref AWS::StackName]]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !If [IsDev, 80, 443]
+          ToPort: !If [IsDev, 80, 443]
+          SourcePrefixListId: pl-3b927c52
+
+  WebsiteLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebsiteLoadBalancer
+      Protocol: !If [IsDev, HTTP, HTTPS]
+      Port: !If [IsDev, 80, 443]
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebsiteLoadBalancerTargetGroup
+      Certificates:
+        !If
+          - IsDev
+          - !Ref AWS::NoValue
+          - - CertificateArn: !Ref AcmCertificateArn
+
+  WebsiteLoadBalancerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Ref AWS::StackName
+      Protocol: HTTP
+      Port: 80
+      VpcId: !FindInMap
+        - Region
+        - !Ref AWS::Region
+        - Vpc
+
+  WebsiteAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: 1
+      MaxSize: 1
+      LaunchTemplate: 
+        LaunchTemplateId: !Ref WebsiteLaunchTemplate
+        Version: !GetAtt WebsiteLaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref WebsiteLoadBalancerTargetGroup
+      AvailabilityZones: 
+        Fn::GetAZs: 
+          !Ref AWS::Region
+
+  WebsiteLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Ref AWS::StackName
+      LaunchTemplateData:
+        InstanceType: t4g.nano
+        IamInstanceProfile:
+          Arn: !GetAtt WebsiteInstanceProfile.Arn
+        ImageId: !FindInMap
+          - Region
+          - !Ref AWS::Region
+          - Ami
+        SecurityGroups:
+          - !Ref WebsiteInstanceSecurityGroup
+        UserData:
+          Fn::Base64: 
+            Fn::Sub:
+              |
+              #!/bin/bash
+              export HOME=/home/ec2-user
+              yum update -y
+              curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.3/install.sh | bash
+              export NVM_DIR="$HOME/.nvm"
+              [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+              [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+              nvm install 16
+              aws s3 sync s3://${WebsiteBucket} ~/website --delete
+              PORT=80 node ~/website/build
+
+  WebsiteInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref WebsiteInstanceRole
+  
+  WebsiteInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Join ["", ["WebsiteInstancePolicy", "-", !Ref AWS::StackName]]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Join ["", [!GetAtt WebsiteBucket.Arn, "/*"]]
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt WebsiteBucket.Arn
+
+  WebsiteInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Ref AWS::StackName
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt WebsiteLoadBalancerSecurityGroup.GroupId
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  WebsiteWWWRedirectBucket:
+    Type: AWS::S3::Bucket
+    Condition: IsProd
+    Properties:
+      BucketName: !Join ["", ["www.", !Ref DomainName]]
+      WebsiteConfiguration:
+        RedirectAllRequestsTo:
+          HostName: !Ref DomainName
+          Protocol: https
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
